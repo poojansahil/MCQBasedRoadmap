@@ -4,6 +4,7 @@ import re
 import json
 import requests
 from datetime import datetime, timedelta
+import time
 
 # Set page configuration
 st.set_page_config(
@@ -17,6 +18,14 @@ st.title("📊 MCQ Assessment Analyzer")
 st.markdown("""
 This application analyzes a student's MCQ assessment answers and generates a personalized roadmap with SMART goals.
 """)
+
+# Initialize session state variables
+if 'student_answers' not in st.session_state:
+    st.session_state.student_answers = {}
+if 'questions' not in st.session_state:
+    st.session_state.questions = []
+if 'correct_answers' not in st.session_state:
+    st.session_state.correct_answers = {}
 
 # Function to remove personal information
 def remove_personal_info(text):
@@ -35,8 +44,78 @@ def remove_personal_info(text):
     
     return text
 
-# Function to generate analysis and roadmap using Hugging Face's API
-def generate_roadmap(assessment_data, grade):
+# Function to try multiple APIs with fallback
+def try_multiple_apis(prompt, api_key=None):
+    # List of API configurations to try in order
+    api_configs = [
+        {
+            "name": "Hugging Face - TinyLlama",
+            "url": "https://api-inference.huggingface.co/models/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+            "payload": {"inputs": prompt},
+            "response_handler": lambda r: r.json()[0]["generated_text"]
+        },
+        {
+            "name": "Hugging Face - FLAN-T5-XXL",
+            "url": "https://api-inference.huggingface.co/models/google/flan-t5-xxl",
+            "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+            "payload": {"inputs": prompt},
+            "response_handler": lambda r: r.json()[0]["generated_text"]
+        },
+        {
+            "name": "Hugging Face - OPT",
+            "url": "https://api-inference.huggingface.co/models/facebook/opt-350m",
+            "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+            "payload": {"inputs": prompt},
+            "response_handler": lambda r: r.json()[0]["generated_text"]
+        },
+        {
+            "name": "Hugging Face - BLOOM",
+            "url": "https://api-inference.huggingface.co/models/bigscience/bloom-560m",
+            "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+            "payload": {"inputs": prompt},
+            "response_handler": lambda r: r.json()[0]["generated_text"]
+        }
+    ]
+    
+    last_error = None
+    
+    # Try each API in sequence
+    for config in api_configs:
+        try:
+            st.info(f"Trying {config['name']}...")
+            
+            response = requests.post(
+                config["url"],
+                headers=config["headers"],
+                json=config["payload"],
+                timeout=30  # 30 second timeout
+            )
+            
+            if response.status_code == 200:
+                try:
+                    result = config["response_handler"](response)
+                    st.success(f"Successfully got response from {config['name']}")
+                    return result
+                except Exception as e:
+                    st.warning(f"Error processing response from {config['name']}: {str(e)}")
+                    last_error = e
+                    continue
+            else:
+                st.warning(f"API {config['name']} returned status code {response.status_code}")
+                last_error = Exception(f"Status code: {response.status_code}")
+                continue
+                
+        except Exception as e:
+            st.warning(f"Error with {config['name']}: {str(e)}")
+            last_error = e
+            continue
+    
+    # If we get here, all APIs failed
+    raise Exception(f"All APIs failed. Last error: {str(last_error)}")
+
+# Function to generate analysis and roadmap 
+def generate_roadmap(assessment_data, grade, api_key=None):
     try:
         # Prepare prompt for the AI
         prompt = f"""
@@ -67,61 +146,44 @@ def generate_roadmap(assessment_data, grade):
         }}
         """
         
-        # API URL for Hugging Face Inference API (using a free open model)
-        # Using TinyLlama as an example, but you can change to another free model
-        API_URL = "https://api-inference.huggingface.co/models/TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        
-        # If you have a Hugging Face API token (free to create an account)
-        # You can uncomment this line and add your token
-        # headers = {"Authorization": f"Bearer YOUR_HUGGING_FACE_TOKEN"}
-        
-        # For completely free usage without token (with limitations)
-        headers = {}
-        
-        # Make API request
-        response = requests.post(
-            API_URL,
-            headers=headers,
-            json={"inputs": prompt}
-        )
-        
-        if response.status_code != 200:
-            # Fallback to local processing if API fails
-            st.warning("API request failed. Falling back to local processing.")
-            return fallback_processing(assessment_data, grade)
-            
-        response_text = response.json()[0]["generated_text"]
-        
-        # Try to extract JSON from the response
+        # Try multiple APIs with fallback
         try:
-            # First try to find JSON block in markdown format
-            json_match = re.search(r'```json\s*([\s\S]*?)\s*```|({[\s\S]*})', response_text)
-            if json_match:
-                json_str = json_match.group(1) if json_match.group(1) else json_match.group(2)
-                analysis = json.loads(json_str)
-            else:
-                # If no JSON format is found, try to extract it from the plain text
-                try:
-                    # Look for content between curly braces
-                    json_match = re.search(r'{.*}', response_text, re.DOTALL)
-                    if json_match:
-                        analysis = json.loads(json_match.group(0))
-                    else:
-                        raise Exception("No JSON found in response")
-                except:
-                    # If all extraction attempts fail, use fallback
-                    st.warning("Failed to parse AI response. Using simplified analysis.")
-                    return fallback_processing(assessment_data, grade)
-        except Exception as e:
-            st.warning(f"Error parsing response: {str(e)}. Using simplified analysis.")
-            return fallback_processing(assessment_data, grade)
-        
-        # Verify the analysis has the expected structure
-        if not all(key in analysis for key in ["strengths", "weaknesses", "smart_goals"]):
-            st.warning("AI response missing required fields. Using simplified analysis.")
-            return fallback_processing(assessment_data, grade)
+            response_text = try_multiple_apis(prompt, api_key)
             
-        return analysis
+            # Try to extract JSON from the response
+            try:
+                # First try to find JSON block in markdown format
+                json_match = re.search(r'```json\s*([\s\S]*?)\s*```|({[\s\S]*})', response_text)
+                if json_match:
+                    json_str = json_match.group(1) if json_match.group(1) else json_match.group(2)
+                    analysis = json.loads(json_str)
+                else:
+                    # If no JSON format is found, try to extract it from the plain text
+                    try:
+                        # Look for content between curly braces
+                        json_match = re.search(r'{.*}', response_text, re.DOTALL)
+                        if json_match:
+                            analysis = json.loads(json_match.group(0))
+                        else:
+                            raise Exception("No JSON found in response")
+                    except:
+                        # If all extraction attempts fail, use fallback
+                        st.warning("Failed to parse AI response. Using simplified analysis.")
+                        return fallback_processing(assessment_data, grade)
+            except Exception as e:
+                st.warning(f"Error parsing response: {str(e)}. Using simplified analysis.")
+                return fallback_processing(assessment_data, grade)
+            
+            # Verify the analysis has the expected structure
+            if not all(key in analysis for key in ["strengths", "weaknesses", "smart_goals"]):
+                st.warning("AI response missing required fields. Using simplified analysis.")
+                return fallback_processing(assessment_data, grade)
+                
+            return analysis
+            
+        except Exception as e:
+            st.warning(f"All APIs failed: {str(e)}. Using simplified analysis.")
+            return fallback_processing(assessment_data, grade)
         
     except Exception as e:
         st.error(f"Error generating roadmap: {str(e)}")
@@ -205,77 +267,283 @@ def create_timeline(goals):
     
     return timeline_goals
 
-# Main content
-col1, col2 = st.columns(2)
+# Function to parse question paper
+def parse_question_paper(text):
+    questions = []
+    answers = {}
+    
+    # Use regex to find questions and their answers
+    question_pattern = r'(?:Question|Q)\s*(\d+)[.:]\s*(.*?)(?=(?:Question|Q)\s*\d+|$)'
+    
+    # Find all matches
+    matches = re.finditer(question_pattern, text, re.DOTALL | re.IGNORECASE)
+    
+    for match in matches:
+        question_num = match.group(1)
+        question_text = match.group(2).strip()
+        
+        # Look for answer key in the question text
+        answer_match = re.search(r'(?:Answer|Ans|Key):\s*([A-E])', question_text, re.IGNORECASE)
+        if answer_match:
+            answer = answer_match.group(1).upper()
+            # Remove the answer key from the question text
+            question_text = re.sub(r'(?:Answer|Ans|Key):\s*[A-E]', '', question_text).strip()
+            answers[question_num] = answer
+        
+        questions.append({
+            'number': question_num,
+            'text': question_text
+        })
+    
+    return questions, answers
 
-with col1:
-    st.header("Input Assessment Data")
+# Tabs for different input methods
+input_tab, results_tab = st.tabs(["Input Data", "Analysis Results"])
+
+with input_tab:
+    col1, col2 = st.columns([1, 1])
     
-    # Grade selection
-    grade = st.selectbox(
-        "Student Grade Level",
-        options=["K", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "College"]
-    )
-    
-    # Choose AI backend
-    ai_option = st.radio(
-        "Choose AI Backend",
-        options=["Hugging Face (Free Tier - No API Key)", 
-                 "Hugging Face (With API Key)"],
-        index=0
-    )
-    
-    # API Key input if selected
-    if ai_option == "Hugging Face (With API Key)":
-        api_key = st.text_input("Enter Hugging Face API Key", type="password")
+    with col1:
+        st.header("Assessment Data")
+        
+        # Grade selection
+        grade = st.selectbox(
+            "Student Grade Level",
+            options=["K", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "College"]
+        )
+        
+        # API Key input (optional)
+        api_key = st.text_input("Hugging Face API Key (optional)", type="password")
         if not api_key:
-            st.info("You can get a free Hugging Face API key by creating an account at huggingface.co")
-    
-    # Model selection for Hugging Face
-    if "Hugging Face" in ai_option:
-        hf_model = st.selectbox(
-            "Select Hugging Face Model",
-            options=[
-                "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                "facebook/opt-350m",
-                "EleutherAI/pythia-410m",
-                "bigscience/bloom-560m"
-            ],
+            st.info("You can use the app without an API key, but using your own key may improve reliability.")
+        
+        # Input method selection
+        input_method = st.radio(
+            "Input Method",
+            options=["Paste Complete Answer Sheet", "Enter Question Paper & Student Answers Separately"],
             index=0
         )
-    
-    # Assessment data input
-    st.subheader("Assessment Details")
-    assessment_data = st.text_area(
-        "Paste the assessment answer sheet here (any personal information will be removed)",
-        height=300,
-        placeholder="Example:\nName: John Doe\nGrade: 10\nSubject: Mathematics\n\nQuestion 1: A (Correct)\nQuestion 2: B (Incorrect)\nQuestion 3: C (Correct)\n..."
-    )
-    
-    if st.button("Analyze and Generate Roadmap", type="primary"):
-        if assessment_data:
-            with st.spinner("Analyzing assessment data..."):
-                # Remove personal information
-                cleaned_data = remove_personal_info(assessment_data)
-                
-                # For debugging - show cleaned data
-                st.subheader("Cleaned Assessment Data (Personal Info Removed)")
-                st.text_area("Cleaned Data", value=cleaned_data, height=150, disabled=True)
-                
-                # Generate roadmap
-                analysis_result = generate_roadmap(cleaned_data, grade)
-                
-                if analysis_result:
-                    st.session_state.analysis_result = analysis_result
-                    st.session_state.grade = grade
-                    st.success("Analysis complete! See results in the right panel.")
+        
+        if input_method == "Paste Complete Answer Sheet":
+            # Assessment data input
+            assessment_data = st.text_area(
+                "Paste the assessment answer sheet here (any personal information will be removed)",
+                height=300,
+                placeholder="Example:\nName: John Doe\nGrade: 10\nSubject: Mathematics\n\nQuestion 1: A (Correct)\nQuestion 2: B (Incorrect)\nQuestion 3: C (Correct)\n..."
+            )
+            
+            # Subject input
+            subject = st.text_input("Subject", value="")
+            
+            if st.button("Analyze and Generate Roadmap", type="primary"):
+                if assessment_data:
+                    with st.spinner("Analyzing assessment data..."):
+                        # Add subject if provided
+                        if subject and not re.search(r'Subject:', assessment_data):
+                            assessment_data = f"Subject: {subject}\n\n{assessment_data}"
+                        
+                        # Remove personal information
+                        cleaned_data = remove_personal_info(assessment_data)
+                        
+                        # Show cleaned data
+                        st.subheader("Cleaned Assessment Data")
+                        st.text_area("Cleaned Data", value=cleaned_data, height=150, disabled=True)
+                        
+                        # Generate roadmap
+                        analysis_result = generate_roadmap(cleaned_data, grade, api_key)
+                        
+                        if analysis_result:
+                            st.session_state.analysis_result = analysis_result
+                            st.session_state.grade = grade
+                            st.success("Analysis complete! See results in the 'Analysis Results' tab.")
+                            # Switch to results tab
+                            st.experimental_set_query_params(tab="results")
+                        else:
+                            st.error("Failed to generate analysis. Please check your input data and try again.")
                 else:
-                    st.error("Failed to generate analysis. Please check your input data and try again.")
-        else:
-            st.warning("Please enter assessment data to analyze.")
+                    st.warning("Please enter assessment data to analyze.")
+        
+        else:  # Enter Question Paper & Student Answers Separately
+            st.subheader("Step 1: Paste Question Paper with Answer Key")
+            
+            question_paper = st.text_area(
+                "Paste the question paper here",
+                height=200,
+                placeholder="Example:\nSubject: Mathematics\n\nQuestion 1: What is 2+2?\nA. 3\nB. 4\nC. 5\nD. 6\nAnswer: B\n\nQuestion 2: What is the square root of 9?\nA. 2\nB. 3\nC. 4\nD. 5\nAnswer: B"
+            )
+            
+            if question_paper:
+                # Extract subject
+                subject_match = re.search(r'Subject:\s*([^\n]+)', question_paper)
+                subject = subject_match.group(1) if subject_match else ""
+                
+                if not subject:
+                    subject = st.text_input("Subject", value="")
+                else:
+                    st.info(f"Detected subject: {subject}")
+                
+                # Parse question paper
+                questions, correct_answers = parse_question_paper(question_paper)
+                
+                if questions:
+                    st.session_state.questions = questions
+                    st.session_state.correct_answers = correct_answers
+                    st.success(f"Found {len(questions)} questions with {len(correct_answers)} answer keys.")
+                else:
+                    st.warning("No questions detected. Please check your question paper format.")
+            
+            st.subheader("Step 2: Enter Student's Answers")
+            
+            if st.session_state.questions:
+                # Display form for student answers
+                for q in st.session_state.questions:
+                    q_num = q['number']
+                    q_text = q['text']
+                    
+                    # Display question summary
+                    truncated_text = q_text[:50] + "..." if len(q_text) > 50 else q_text
+                    st.markdown(f"**Q{q_num}:** {truncated_text}")
+                    
+                    # Multi-choice input
+                    if q_num in st.session_state.student_answers:
+                        default_idx = "ABCDE".find(st.session_state.student_answers[q_num])
+                        default_idx = default_idx if default_idx >= 0 else 0
+                    else:
+                        default_idx = 0
+                        
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        student_answer = st.radio(
+                            f"Student's answer for Q{q_num}",
+                            options=['A', 'B', 'C', 'D', 'E'],
+                            index=default_idx,
+                            horizontal=True,
+                            key=f"answer_{q_num}"
+                        )
+                    
+                    with col2:
+                        if q_num in st.session_state.correct_answers:
+                            correct = st.session_state.correct_answers[q_num]
+                            is_correct = student_answer == correct
+                            st.markdown(f"Correct Answer: **{correct}**")
+                            if is_correct:
+                                st.success("Correct!")
+                            else:
+                                st.error("Incorrect")
+                        else:
+                            st.info("No answer key available")
+                    
+                    # Store answer in session state
+                    st.session_state.student_answers[q_num] = student_answer
+                    
+                    st.divider()
+                
+                if st.button("Generate Assessment Analysis", type="primary"):
+                    # Prepare assessment data
+                    assessment_lines = [f"Subject: {subject}", ""]
+                    
+                    correct_count = 0
+                    total_questions = len(st.session_state.questions)
+                    
+                    for q in st.session_state.questions:
+                        q_num = q['number']
+                        if q_num in st.session_state.student_answers:
+                            student_ans = st.session_state.student_answers[q_num]
+                            correct_ans = st.session_state.correct_answers.get(q_num, None)
+                            
+                            if correct_ans:
+                                is_correct = student_ans == correct_ans
+                                status = "(Correct)" if is_correct else "(Incorrect)"
+                                if is_correct:
+                                    correct_count += 1
+                            else:
+                                status = ""
+                                
+                            assessment_lines.append(f"Question {q_num}: {student_ans} {status}")
+                    
+                    # Add score if we have correct answers
+                    if st.session_state.correct_answers:
+                        score_percent = round((correct_count / total_questions) * 100)
+                        assessment_lines.append("")
+                        assessment_lines.append(f"Total Score: {correct_count}/{total_questions} ({score_percent}%)")
+                    
+                    assessment_text = "\n".join(assessment_lines)
+                    
+                    with st.spinner("Analyzing assessment data..."):
+                        # Generate roadmap
+                        analysis_result = generate_roadmap(assessment_text, grade, api_key)
+                        
+                        if analysis_result:
+                            st.session_state.analysis_result = analysis_result
+                            st.session_state.grade = grade
+                            st.success("Analysis complete! See results in the 'Analysis Results' tab.")
+                            # Switch to results tab
+                            st.experimental_set_query_params(tab="results")
+                        else:
+                            st.error("Failed to generate analysis. Please check your input data and try again.")
+            else:
+                st.info("Please paste a question paper first to enter student answers.")
+    
+    with col2:
+        st.header("Sample Input Formats")
+        
+        with st.expander("Sample Question Paper Format"):
+            st.code("""
+Subject: Mathematics
 
-# Results display
-with col2:
+Question 1: What is 2+2?
+A. 3
+B. 4
+C. 5
+D. 6
+Answer: B
+
+Question 2: What is the square root of 9?
+A. 2
+B. 3
+C. 4
+D. 5
+Answer: B
+
+Question 3: Solve for x: 3x + 5 = 14
+A. x = 3
+B. x = 4
+C. x = 5
+D. x = 6
+Answer: A
+            """)
+        
+        with st.expander("Sample Complete Answer Sheet Format"):
+            st.code("""
+Name: John Doe
+ID: S12345
+Grade: 8
+Subject: Science
+
+Question 1: B (Correct)
+Question 2: C (Incorrect)
+Question 3: A (Correct)
+Question 4: D (Correct)
+Question 5: A (Incorrect)
+
+Total Score: 3/5 (60%)
+            """)
+        
+        st.header("How It Works")
+        st.markdown("""
+        1. **Input your data** - Either paste a complete answer sheet or enter a question paper and student answers separately
+        2. **AI analysis** - The app uses multiple open-source AI models to analyze the student's performance
+        3. **Fallback system** - If one API fails, the app automatically tries others
+        4. **Personalized roadmap** - The analysis generates SMART goals with specific timelines
+        5. **Privacy protection** - Personal information is automatically removed
+        
+        For best results, include:
+        - The subject area
+        - Correct/incorrect markings for each answer
+        - Grade level of the student
+        """)
+
+with results_tab:
     st.header("Analysis Results")
     
     if 'analysis_result' in st.session_state:
@@ -326,69 +594,82 @@ with col2:
                 height=300
             )
             
-            # Export button
-            st.download_button(
-                "Download Roadmap as CSV",
-                df.to_csv(index=False).encode('utf-8'),
-                "student_roadmap.csv",
-                "text/csv",
-                key='download-csv'
-            )
+            # Export options
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "📥 Download Roadmap as CSV",
+                    df.to_csv(index=False).encode('utf-8'),
+                    "student_roadmap.csv",
+                    "text/csv",
+                    key='download-csv'
+                )
+            
+            with col2:
+                # Create a printable version for PDF
+                markdown_text = "# Student Learning Roadmap\n\n"
+                markdown_text += f"**Date Generated:** {datetime.now().strftime('%Y-%m-%d')}\n\n"
+                
+                markdown_text += "## Strengths\n"
+                for strength in analysis.get("strengths", []):
+                    markdown_text += f"* {strength}\n"
+                
+                markdown_text += "\n## Areas for Improvement\n"
+                for weakness in analysis.get("weaknesses", []):
+                    markdown_text += f"* {weakness}\n"
+                
+                markdown_text += "\n## SMART Goals and Timeline\n\n"
+                for i, goal in enumerate(timeline_goals, 1):
+                    markdown_text += f"### Goal {i}: {goal['goal']}\n"
+                    markdown_text += f"**Subject Area:** {goal['area']}\n"
+                    markdown_text += f"**Measurement:** {goal['measurement']}\n"
+                    markdown_text += f"**Timeline:** {goal['start_date']} to {goal['end_date']}\n\n"
+                
+                st.download_button(
+                    "📄 Download as Markdown/Text",
+                    markdown_text,
+                    "student_roadmap.md",
+                    "text/plain",
+                    key='download-md'
+                )
         else:
             st.info("No SMART goals generated. Please try again with different assessment data.")
     else:
-        st.info("Enter assessment data and click 'Analyze' to generate a personalized roadmap.")
+        st.info("Enter assessment data in the 'Input Data' tab and click 'Analyze' to generate a personalized roadmap.")
 
 # Add footer with disclaimer
 st.markdown("---")
 st.caption("Disclaimer: This tool is for educational purposes only. The roadmap generated is based on AI analysis and should be reviewed by an education professional.")
 
-# Sidebar with instructions
+# Sidebar with information
 with st.sidebar:
-    st.header("Instructions")
+    st.header("About This App")
     st.markdown("""
-    ### How to use this tool:
+    ### MCQ Assessment Analyzer
+
+    This application helps educators and students analyze multiple-choice assessment results and create personalized learning roadmaps with SMART goals.
     
-    1. **Select the student's grade level**
-    2. **Choose AI backend**:
-       - Hugging Face (free, no API key required)
-       - Hugging Face with your own API key
-    3. **Enter the assessment data** including:
-       - Subject(s) covered
-       - Questions and answers
-       - Correct/incorrect markings
-    4. **Click 'Analyze and Generate Roadmap'**
-    5. **Review the results** in the right panel
+    **Key Features:**
+    - Multiple input methods
+    - Personal information removal
+    - Resilient API fallback system
+    - SMART goal generation
+    - Visual timeline
+    - Multiple export options
     
-    ### Sample Input Format:
-    ```
-    Subject: Mathematics
+    **Open-Source AI Integration:**
+    The app uses multiple free-tier LLM APIs for analysis, with an automatic fallback system if one API isn't working.
     
-    Question 1: A (Correct)
-    Question 2: B (Incorrect)
-    Question 3: C (Correct)
-    Question 4: A (Incorrect)
-    Question 5: D (Correct)
-    
-    Total Score: 3/5
-    ```
-    
-    ### Notes:
-    - All personal information will be automatically removed
-    - For best results, include specific details about questions and correct/incorrect answers
-    - The free tier models may have limited quality compared to premium models
-    - If the AI fails to generate a proper analysis, a fallback system will provide basic recommendations
+    **Privacy First:**
+    All personal data is automatically removed before processing.
     """)
     
     st.markdown("---")
-    st.subheader("About")
+    st.subheader("Understanding SMART Goals")
     st.markdown("""
-    This app uses Hugging Face's free inference API to analyze student performance on MCQ assessments and generate personalized learning roadmaps.
-    
-    The roadmap includes SMART goals that are:
-    - **Specific**: Clearly defined objectives
-    - **Measurable**: Progress can be tracked
-    - **Achievable**: Realistic for the student's level
-    - **Relevant**: Related to areas needing improvement
-    - **Time-bound**: With suggested completion dates
+    **S**pecific: Clearly defined objectives  
+    **M**easurable: Progress can be tracked  
+    **A**chievable: Realistic for the student's level  
+    **R**elevant: Related to areas needing improvement  
+    **T**ime-bound: With specific completion dates
     """)
