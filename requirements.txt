@@ -3,3 +3,6 @@ Pillow
 requests
 streamlit
 pandas
+numpy
+plotly
+matplotlib
